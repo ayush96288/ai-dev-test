@@ -1,4 +1,5 @@
 
+
 name: Daily AI Project Audit
 
 on:
@@ -25,6 +26,7 @@ jobs:
           python - <<'PY'
           import json
           import os
+          import socket
           import urllib.request
           import urllib.error
           from pathlib import Path
@@ -42,32 +44,41 @@ jobs:
 
           prompt = f"""
           You are my software project auditor.
+
           Review this project description:
           {description}
 
-          Report:
+          Write a report covering:
           1. What the project appears to do.
           2. Three useful improvements.
           3. Potential risks or missing information.
           4. What should be tested next.
 
-          Be specific and honest. Do not claim you ran tests.
-          Do not modify files. Suggest only one next priority.
+          Be specific and honest.
+          Do not claim you ran tests.
+          Do not modify files.
+          End with only one next priority.
           """
 
           payload = {
-              "contents": [{
-                  "parts": [{"text": prompt}]
-              }],
+              "contents": [
+                  {"parts": [{"text": prompt}]}
+              ],
               "generationConfig": {
                   "temperature": 0.2,
-                  "maxOutputTokens": 1000
+                  "maxOutputTokens": 800
               }
           }
 
+          url = (
+              "https://generativelanguage.googleapis.com/"
+              "v1beta/models/gemini-3.8-flash:"
+              "streamGenerateContent?alt=sse"
+          )
+
           request = urllib.request.Request(
-              "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent",
-              data=json.dumps(payload).encode(),
+              url,
+              data=json.dumps(payload).encode("utf-8"),
               headers={
                   "Content-Type": "application/json",
                   "x-goog-api-key": key
@@ -75,27 +86,66 @@ jobs:
               method="POST"
           )
 
+          report_parts = []
+
           try:
-              with urllib.request.urlopen(request, timeout=150) as response:
-                  data = json.loads(response.read().decode())
+              print("Connecting to Gemini API...")
+
+              with urllib.request.urlopen(
+                  request, timeout=90
+              ) as response:
+                  for raw_line in response:
+                      line = raw_line.decode(
+                          "utf-8", errors="replace"
+                      ).strip()
+
+                      if not line.startswith("data:"):
+                          continue
+
+                      event_text = line[5:].strip()
+
+                      if not event_text or event_text == "[DONE]":
+                          continue
+
+                      try:
+                          event = json.loads(event_text)
+                      except json.JSONDecodeError:
+                          continue
+
+                      for candidate in event.get("candidates", []):
+                          content = candidate.get("content", {})
+                          for part in content.get("parts", []):
+                              text = part.get("text", "")
+                              if text:
+                                  report_parts.append(text)
+
           except urllib.error.HTTPError as error:
+              details = error.read().decode(
+                  "utf-8", errors="replace"
+              )
+              print(f"Gemini API returned HTTP {error.code}.")
+              print(details[:2000])
+              raise SystemExit(1)
+
+          except (TimeoutError, socket.timeout):
               raise SystemExit(
-                  f"Gemini API error: HTTP {error.code}. "
-                  "Check API access, quota and secret."
+                  "Gemini timed out after 90 seconds. "
+                  "Check the model name, API access and service status."
               )
 
-          candidates = data.get("candidates", [])
-          if not candidates:
-              raise SystemExit("AI returned no report.")
+          except urllib.error.URLError as error:
+              raise SystemExit(
+                  f"Could not connect to Gemini: {error.reason}"
+              )
 
-          parts = candidates[0].get("content", {}).get("parts", [])
-          report = "\n".join(
-              part.get("text", "") for part in parts
-          )
+          report = "".join(report_parts).strip()
 
-          if not report.strip():
-              raise SystemExit("AI report was empty.")
+          if not report:
+              raise SystemExit(
+                  "Gemini returned no report text. "
+                  "Check the model name, API access and quota."
+              )
 
-          print("DAILY AI PROJECT REPORT")
+          print("\nDAILY AI PROJECT REPORT\n")
           print(report)
           PY
