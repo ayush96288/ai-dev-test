@@ -1,5 +1,4 @@
 
-
 name: Daily AI Project Audit
 
 on:
@@ -27,6 +26,7 @@ jobs:
           import json
           import os
           import socket
+          import time
           import urllib.request
           import urllib.error
           from pathlib import Path
@@ -45,7 +45,7 @@ jobs:
           prompt = f"""
           You are my software project auditor.
 
-          Review this project description:
+          Project description:
           {description}
 
           Write a report covering:
@@ -76,74 +76,101 @@ jobs:
               "streamGenerateContent?alt=sse"
           )
 
-          request = urllib.request.Request(
-              url,
-              data=json.dumps(payload).encode("utf-8"),
-              headers={
-                  "Content-Type": "application/json",
-                  "x-goog-api-key": key
-              },
-              method="POST"
-          )
+          report = ""
 
-          report_parts = []
-
-          try:
-              print("Connecting to Gemini API...")
-
-              with urllib.request.urlopen(
-                  request, timeout=90
-              ) as response:
-                  for raw_line in response:
-                      line = raw_line.decode(
-                          "utf-8", errors="replace"
-                      ).strip()
-
-                      if not line.startswith("data:"):
-                          continue
-
-                      event_text = line[5:].strip()
-
-                      if not event_text or event_text == "[DONE]":
-                          continue
-
-                      try:
-                          event = json.loads(event_text)
-                      except json.JSONDecodeError:
-                          continue
-
-                      for candidate in event.get("candidates", []):
-                          content = candidate.get("content", {})
-                          for part in content.get("parts", []):
-                              text = part.get("text", "")
-                              if text:
-                                  report_parts.append(text)
-
-          except urllib.error.HTTPError as error:
-              details = error.read().decode(
-                  "utf-8", errors="replace"
-              )
-              print(f"Gemini API returned HTTP {error.code}.")
-              print(details[:2000])
-              raise SystemExit(1)
-
-          except (TimeoutError, socket.timeout):
-              raise SystemExit(
-                  "Gemini timed out after 90 seconds. "
-                  "Check the model name, API access and service status."
+          for attempt in range(1, 5):
+              request = urllib.request.Request(
+                  url,
+                  data=json.dumps(payload).encode("utf-8"),
+                  headers={
+                      "Content-Type": "application/json",
+                      "x-goog-api-key": key
+                  },
+                  method="POST"
               )
 
-          except urllib.error.URLError as error:
-              raise SystemExit(
-                  f"Could not connect to Gemini: {error.reason}"
-              )
+              parts = []
 
-          report = "".join(report_parts).strip()
+              try:
+                  print(
+                      f"Connecting to Gemini "
+                      f"(attempt {attempt}/4)...",
+                      flush=True
+                  )
+
+                  with urllib.request.urlopen(
+                      request, timeout=60
+                  ) as response:
+                      for raw_line in response:
+                          line = raw_line.decode(
+                              "utf-8", errors="replace"
+                          ).strip()
+
+                          if not line.startswith("data:"):
+                              continue
+
+                          event_text = line[5:].strip()
+                          if not event_text or event_text == "[DONE]":
+                              continue
+
+                          try:
+                              event = json.loads(event_text)
+                          except json.JSONDecodeError:
+                              continue
+
+                          for candidate in event.get("candidates", []):
+                              content = candidate.get("content", {})
+                              for part in content.get("parts", []):
+                                  text = part.get("text", "")
+                                  if text:
+                                      parts.append(text)
+
+                  report = "".join(parts).strip()
+                  if report:
+                      break
+
+                  print("No report text received.")
+
+              except urllib.error.HTTPError as error:
+                  details = error.read().decode(
+                      "utf-8", errors="replace"
+                  )
+                  retryable = error.code in (
+                      408, 429, 500, 502, 503, 504
+                  )
+
+                  if not retryable or attempt == 4:
+                      print(f"Gemini API HTTP {error.code}:")
+                      print(details[:2000])
+                      raise SystemExit(1)
+
+                  print(
+                      f"Temporary HTTP {error.code}; "
+                      "will retry."
+                  )
+
+              except (TimeoutError, socket.timeout):
+                  if attempt == 4:
+                      raise SystemExit(
+                          "Gemini timed out after four attempts."
+                      )
+                  print("Request timed out; will retry.")
+
+              except urllib.error.URLError as error:
+                  if attempt == 4:
+                      raise SystemExit(
+                          f"Connection failed: {error.reason}"
+                      )
+                  print("Connection issue; will retry.")
+
+              if attempt < 4:
+                  wait = 2 ** attempt
+                  print(f"Waiting {wait} seconds...")
+                  time.sleep(wait)
 
           if not report:
               raise SystemExit(
-                  "Gemini returned no report text. "
-                  "Check the model name, API access and quota."
+                  "No AI report was generated after four attempts."
               )
 
           print("\nDAILY AI PROJECT REPORT\n")
