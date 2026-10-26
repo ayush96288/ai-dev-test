@@ -1,0 +1,101 @@
+
+name: Daily AI Project Audit
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 3 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Get project files
+        uses: actions/checkout@v4
+
+      - name: Ask AI to audit the project
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.request
+          import urllib.error
+          from pathlib import Path
+
+          key = os.environ.get("GEMINI_API_KEY")
+          if not key:
+              raise SystemExit("Missing GEMINI_API_KEY secret.")
+
+          readme = Path("README.md")
+          description = (
+              readme.read_text(encoding="utf-8")[:6000]
+              if readme.exists()
+              else "No README.md found."
+          )
+
+          prompt = f"""
+          You are my software project auditor.
+          Review this project description:
+          {description}
+
+          Report:
+          1. What the project appears to do.
+          2. Three useful improvements.
+          3. Potential risks or missing information.
+          4. What should be tested next.
+
+          Be specific and honest. Do not claim you ran tests.
+          Do not modify files. Suggest only one next priority.
+          """
+
+          payload = {
+              "contents": [{
+                  "parts": [{"text": prompt}]
+              }],
+              "generationConfig": {
+                  "temperature": 0.2,
+                  "maxOutputTokens": 1000
+              }
+          }
+
+          request = urllib.request.Request(
+              "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent",
+              data=json.dumps(payload).encode(),
+              headers={
+                  "Content-Type": "application/json",
+                  "x-goog-api-key": key
+              },
+              method="POST"
+          )
+
+          try:
+              with urllib.request.urlopen(request, timeout=45) as response:
+                  data = json.loads(response.read().decode())
+          except urllib.error.HTTPError as error:
+              raise SystemExit(
+                  f"Gemini API error: HTTP {error.code}. "
+                  "Check API access, quota and secret."
+              )
+
+          candidates = data.get("candidates", [])
+          if not candidates:
+              raise SystemExit("AI returned no report.")
+
+          parts = candidates[0].get("content", {}).get("parts", [])
+          report = "\n".join(
+              part.get("text", "") for part in parts
+          )
+
+          if not report.strip():
+              raise SystemExit("AI report was empty.")
+
+          print("DAILY AI PROJECT REPORT")
+          print(report)
+          PY
