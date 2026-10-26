@@ -1,4 +1,3 @@
-
 name: Daily AI Project Audit
 
 on:
@@ -12,7 +11,7 @@ permissions:
 jobs:
   audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
       - name: Get project files
@@ -21,26 +20,36 @@ jobs:
       - name: Ask AI to audit the project
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Models are tried in this order. All are listed as Stable with a
+          # free tier in Google's docs (checked 26 Oct 2026). Edit here only.
+          GEMINI_MODELS: "gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.8-flash"
         run: |
           python - <<'PY'
           import json
           import os
           import socket
           import time
-          import urllib.request
           import urllib.error
+          import urllib.request
           from pathlib import Path
 
-          key = os.environ.get("GEMINI_API_KEY")
+          key = os.environ.get("GEMINI_API_KEY", "").strip()
           if not key:
               raise SystemExit("Missing GEMINI_API_KEY secret.")
 
+          models = [
+              m.strip()
+              for m in os.environ.get("GEMINI_MODELS", "").split(",")
+              if m.strip()
+          ]
+          if not models:
+              raise SystemExit("GEMINI_MODELS is empty.")
+
           readme = Path("README.md")
-          description = (
-              readme.read_text(encoding="utf-8")[:6000]
-              if readme.exists()
-              else "No README.md found."
-          )
+          if readme.exists():
+              description = readme.read_text(encoding="utf-8")[:6000]
+          else:
+              description = "No README.md found."
 
           prompt = f"""
           You are my software project auditor.
@@ -60,119 +69,111 @@ jobs:
           End with only one next priority.
           """
 
-          payload = {
-              "contents": [
-                  {"parts": [{"text": prompt}]}
-              ],
-              "generationConfig": {
-                  "temperature": 0.2,
-                  "maxOutputTokens": 800
-              }
-          }
+          # maxOutputTokens is generous because "thinking" tokens can count
+          # toward it; a small limit can leave no room for the visible report.
+          payload = json.dumps({
+              "contents": [{"parts": [{"text": prompt}]}],
+              "generationConfig": {"maxOutputTokens": 4000},
+          }).encode("utf-8")
 
-          url = (
-              "https://generativelanguage.googleapis.com/"
-              "v1beta/models/gemini-3.8-flash:"
-              "streamGenerateContent?alt=sse"
-          )
+          ATTEMPTS_PER_MODEL = 2
+          WAIT_SECONDS = 10
 
-          report = ""
 
-          for attempt in range(1, 5):
+          def call_model(model):
+              """Return (report, outcome). outcome is one of:
+              'ok', 'retry' (temporary), 'next_model', 'fatal'."""
+              url = (
+                  "https://generativelanguage.googleapis.com/"
+                  f"v1beta/models/{model}:generateContent"
+              )
               request = urllib.request.Request(
                   url,
-                  data=json.dumps(payload).encode("utf-8"),
+                  data=payload,
                   headers={
                       "Content-Type": "application/json",
-                      "x-goog-api-key": key
+                      "x-goog-api-key": key,
                   },
-                  method="POST"
+                  method="POST",
               )
-
-              parts = []
-
               try:
-                  print(
-                      f"Connecting to Gemini "
-                      f"(attempt {attempt}/4)...",
-                      flush=True
-                  )
-
-                  with urllib.request.urlopen(
-                      request, timeout=60
-                  ) as response:
-                      for raw_line in response:
-                          line = raw_line.decode(
-                              "utf-8", errors="replace"
-                          ).strip()
-
-                          if not line.startswith("data:"):
-                              continue
-
-                          event_text = line[5:].strip()
-                          if not event_text or event_text == "[DONE]":
-                              continue
-
-                          try:
-                              event = json.loads(event_text)
-                          except json.JSONDecodeError:
-                              continue
-
-                          for candidate in event.get("candidates", []):
-                              content = candidate.get("content", {})
-                              for part in content.get("parts", []):
-                                  text = part.get("text", "")
-                                  if text:
-                                      parts.append(text)
-
-                  report = "".join(parts).strip()
-                  if report:
-                      break
-
-                  print("No report text received.")
-
+                  with urllib.request.urlopen(request, timeout=90) as resp:
+                      data = json.loads(resp.read().decode("utf-8"))
               except urllib.error.HTTPError as error:
-                  details = error.read().decode(
-                      "utf-8", errors="replace"
-                  )
-                  retryable = error.code in (
-                      408, 429, 500, 502, 503, 504
-                  )
-
-                  if not retryable or attempt == 4:
-                      print(f"Gemini API HTTP {error.code}:")
-                      print(details[:2000])
-                      raise SystemExit(1)
-
-                  print(
-                      f"Temporary HTTP {error.code}; "
-                      "will retry."
-                  )
-
+                  body = error.read().decode("utf-8", errors="replace")
+                  code = error.code
+                  print(f"  HTTP {code} from {model}: {body[:300]}")
+                  if code in (401, 403):
+                      print("  -> API key or permission problem. "
+                            "Retrying or switching models will not help.")
+                      return "", "fatal"
+                  if code in (404, 429):
+                      return "", "next_model"
+                  if code in (408, 500, 502, 503, 504):
+                      return "", "retry"
+                  return "", "next_model"
               except (TimeoutError, socket.timeout):
-                  if attempt == 4:
-                      raise SystemExit(
-                          "Gemini timed out after four attempts."
-                      )
-                  print("Request timed out; will retry.")
-
+                  print(f"  Timed out waiting for {model}.")
+                  return "", "retry"
               except urllib.error.URLError as error:
-                  if attempt == 4:
-                      raise SystemExit(
-                          f"Connection failed: {error.reason}"
-                      )
-                  print("Connection issue; will retry.")
+                  print(f"  Connection problem: {error.reason}")
+                  return "", "retry"
+              except json.JSONDecodeError:
+                  print("  Response was not valid JSON.")
+                  return "", "retry"
 
-              if attempt < 4:
-                  wait = 2 ** attempt
-                  print(f"Waiting {wait} seconds...")
-                  time.sleep(wait)
+              feedback = data.get("promptFeedback", {})
+              if feedback.get("blockReason"):
+                  print(f"  Prompt blocked: {feedback['blockReason']}")
+                  return "", "next_model"
+
+              texts = []
+              finish = None
+              for candidate in data.get("candidates", []):
+                  finish = candidate.get("finishReason", finish)
+                  for part in candidate.get("content", {}).get("parts", []):
+                      if part.get("text") and not part.get("thought"):
+                          texts.append(part["text"])
+              report = "".join(texts).strip()
+              if not report:
+                  print(f"  Empty report (finishReason={finish}).")
+                  return "", "next_model"
+              if finish not in (None, "STOP"):
+                  report += (
+                      f"\n\n[Note: output ended early "
+                      f"(finishReason={finish}); report may be incomplete.]"
+                  )
+              return report, "ok"
+
+
+          report = ""
+          used_model = None
+          for model in models:
+              for attempt in range(1, ATTEMPTS_PER_MODEL + 1):
+                  print(f"Trying {model} "
+                        f"(attempt {attempt}/{ATTEMPTS_PER_MODEL})...",
+                        flush=True)
+                  report, outcome = call_model(model)
+                  if outcome == "ok":
+                      used_model = model
+                      break
+                  if outcome == "fatal":
+                      raise SystemExit(1)
+                  if outcome == "next_model":
+                      break
+                  if attempt < ATTEMPTS_PER_MODEL:
+                      print(f"  Waiting {WAIT_SECONDS}s before retry...",
+                            flush=True)
+                      time.sleep(WAIT_SECONDS)
+              if used_model:
+                  break
 
           if not report:
               raise SystemExit(
-                  "No AI report was generated after four attempts."
+                  "FAILED: no model produced a report. Models tried: "
+                  + ", ".join(models)
               )
 
-          print("\nDAILY AI PROJECT REPORT\n")
+          print(f"\nDAILY AI PROJECT REPORT (model: {used_model})\n")
           print(report)
           PY
